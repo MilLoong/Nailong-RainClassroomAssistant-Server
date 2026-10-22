@@ -1,0 +1,13 @@
+.reference/
+.venv/
+__pycache__/
+.pytest_cache/
+*.db*
+.env
+pairing.svg
+.local-dev/
+/pairing*.png
+/nailong-*.tar.gz
+/tencent-*.png
+/aliyun-trial-status.png
+/huawei-verification-required.png

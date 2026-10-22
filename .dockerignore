@@ -1,0 +1,9 @@
+.reference
+.venv
+.git
+*.db*
+.env
+__pycache__
+.pytest_cache
+pairing.svg
+.local-dev
