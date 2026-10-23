@@ -65,6 +65,24 @@ class Result(BaseModel):
     message: str = Field(default="", max_length=1000)
 
 
+class ExecutionMode(BaseModel):
+    mode: str = Field(pattern='^(server|local)$')
+    checked_lessons: list[str] = Field(default_factory=list, max_length=5000)
+
+
+class LocationConfig(BaseModel):
+    model_config = {'extra': 'forbid'}
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lng: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    address: str = Field(default='', max_length=2000)
+
+
+class CheckinConfig(BaseModel):
+    model_config = {'extra': 'forbid'}
+    delay_seconds: int = Field(default=0, ge=0, le=86400)
+    location: LocationConfig | None = None
+
+
 class TestNotification(BaseModel):
     title: str = Field(default='雨课堂助手：测试通知', min_length=1, max_length=100)
     body: str = Field(default='这是一条服务端发送的测试通知，不会执行签到。', min_length=1, max_length=500)
@@ -92,6 +110,12 @@ class Store:
                 db.execute("ALTER TABLE devices ADD COLUMN credential_kind TEXT NOT NULL DEFAULT 'desktop'")
             if 'device_info' not in columns:
                 db.execute("ALTER TABLE devices ADD COLUMN device_info TEXT NOT NULL DEFAULT '{}'")
+            if 'execution_mode' not in columns:
+                db.execute("ALTER TABLE devices ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'legacy'")
+            if 'checkin_config' not in columns:
+                db.execute('ALTER TABLE devices ADD COLUMN checkin_config TEXT')
+            db.execute('CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, '
+                       'device TEXT NOT NULL, job TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, created REAL NOT NULL)')
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             if 'kind' not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'checkin'")
@@ -119,8 +143,9 @@ class Store:
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM jobs WHERE device=? AND done=0 AND available<=? '
-                             'AND expires>? AND lease_until<=? ORDER BY created LIMIT 1',
-                             (device, now, now, now)).fetchone()
+                             "AND expires>? AND lease_until<=? AND (kind!='checkin' OR NOT EXISTS "
+                             "(SELECT 1 FROM devices WHERE id=? AND execution_mode!='legacy')) ORDER BY created LIMIT 1",
+                             (device, now, now, now, device)).fetchone()
             if not row:
                 return None
             token = secrets.token_urlsafe(24)
@@ -134,11 +159,19 @@ class Store:
         task_id = secrets.token_urlsafe(18)
         payload = json.dumps({'title': title, 'body': body, 'test': True}, ensure_ascii=False)
         with self.db() as db:
-            if not db.execute('SELECT 1 FROM devices WHERE id=? AND revoked=0', (device,)).fetchone():
+            active = db.execute('SELECT execution_mode FROM devices WHERE id=? AND revoked=0', (device,)).fetchone()
+            if not active:
                 raise HTTPException(404, 'active_device_not_found')
             db.execute('INSERT INTO jobs(id,device,lesson,payload,created,available,expires,kind) '
                        'VALUES(?,?,?,?,?,?,?,?)',
                        (task_id, device, 'notification:' + task_id, payload, now, now, now + ttl, 'notification'))
+            if active['execution_mode'] != 'legacy':
+                event = {'success': True, 'message': body, 'title': title, 'kind': 'notification',
+                         'lesson': {'courseName': '测试通知', 'lessonId': ''}}
+                db.execute('INSERT INTO events(device,job,payload,created) VALUES(?,?,?,?)',
+                           (device, task_id, json.dumps(event), now))
+                db.execute('UPDATE jobs SET done=1,result=? WHERE id=?',
+                           (json.dumps({'success': True, 'message': 'notification_stored_for_sync'}), task_id))
         return {'task_id': task_id, 'status': 'queued', 'expires_at': now + ttl}
 
 
@@ -164,6 +197,66 @@ async def fetch_lessons(client, sessionid, kind='desktop'):
     return lessons
 
 
+async def submit_location_checkin(client, sid, lesson, location):
+    if not location:
+        return {'success': False, 'message': 'location_config_required'}
+    headers = {'Cookie': f'sid={sid}', 'x-client': 'app', 'xtbz': 'ykt'}
+    address = location.get('address', '')
+    if not address:
+        try:
+            response = await client.get('https://www.yuketang.cn/api/v3/tencent-lbs/proxy', headers=headers,
+                                        params={'lbsPath': 'geocoder/v1',
+                                                'location': f"{location['lat']},{location['lng']}", 'get_poi': '2'})
+            response.raise_for_status()
+            body = response.json()
+            data = body.get('data') or {}
+            if body.get('code') == 0:
+                address = data.get('address') or (data.get('result') or {}).get('address', '')
+        except httpx.HTTPError:
+            pass
+    response = await client.post('https://www.yuketang.cn/api/v3/lesson/location-checkin/submit',
+                                 headers=headers, json={'lat': str(location['lat']), 'lng': str(location['lng']),
+                                                        'lessonId': str(lesson), 'source': 54, 'address': address})
+    response.raise_for_status()
+    body = response.json()
+    return {'success': body.get('code') == 0, 'message': 'location_checked_in' if body.get('code') == 0
+            else 'login_expired' if 'UNAUTHENTICATED' in str(body.get('msg', '')).upper()
+            else 'location_checkin_rejected'}
+
+
+async def submit_checkin(client, sid, lesson, config=None):
+    if not str(lesson).isdigit():
+        return {'success': False, 'message': 'invalid_lesson_id'}
+    location = (config or {}).get('location')
+    if location:
+        response = await client.get('https://www.yuketang.cn/api/v3/lesson/location-checkin/eligibility',
+                                    headers={'Cookie': f'sid={sid}', 'x-client': 'app', 'xtbz': 'ykt'},
+                                    params={'lessonId': str(lesson), 'lesson_id': str(lesson)})
+        response.raise_for_status()
+        eligibility = response.json()
+        data = eligibility.get('data') or {}
+        if eligibility.get('code') == 0:
+            if data.get('signed'):
+                return {'success': True, 'message': 'location_already_checked_in'}
+            if data.get('needLocationSignIn') or data.get('canSign') or data.get('session') is not None:
+                return await submit_location_checkin(client, sid, lesson, location)
+    response = await client.post('https://www.yuketang.cn/api/v3/lesson/checkin',
+                                 headers={'Cookie': f'sid={sid}', 'x-client': 'app'},
+                                 json={'source': 21, 'lessonId': str(lesson), 'joinIfNotIn': True})
+    response.raise_for_status()
+    body = response.json()
+    if body.get('code') == 0:
+        return {'success': True, 'message': 'checked_in'}
+    message = str(body.get('msg', '')).upper()
+    if 'LOCATION' in message or '定位' in message:
+        return await submit_location_checkin(client, sid, lesson, location)
+    reason = ('login_expired' if 'UNAUTHENTICATED' in message else
+              'checkin_rejected_dynamic_qr' if 'DYNAMIC_QR' in message else
+              'location_requires_manual_checkin' if 'LOCATION' in message or '定位' in message else
+              'checkin_rejected_check_app')
+    return {'success': False, 'message': reason}
+
+
 def create_app(db_path=None, admin_token=None, encryption_key=None, monitor=True):
     admin = admin_token or os.environ.get('ADMIN_TOKEN', '')
     if len(admin) < 32:
@@ -171,6 +264,66 @@ def create_app(db_path=None, admin_token=None, encryption_key=None, monitor=True
     cipher = Fernet(encryption_key or os.environ['ENCRYPTION_KEY'])
     store = Store(db_path or os.environ.get('DATABASE_PATH', 'nailong.db'))
     interval = max(3, int(os.environ.get('POLL_INTERVAL', '10')))
+    # One worker per database: mode acknowledgement waits for any in-flight submission.
+    execution_lock = asyncio.Lock()
+
+    async def execute_pending(client, device, sid, config):
+        with store.db() as db:
+            rows = db.execute("SELECT * FROM jobs WHERE device=? AND kind='checkin' AND done=0 "
+                              'AND available<=? AND expires>?', (device, time.time(), time.time())).fetchall()
+        for job in rows:
+            uncertain = {'success': False, 'message': 'execution_uncertain_check_manually'}
+            # Persist before the non-idempotent request. A crash must never trigger replay.
+            with store.db() as db:
+                claimed = db.execute('UPDATE jobs SET done=1,result=? WHERE id=? AND done=0 AND EXISTS '
+                                     "(SELECT 1 FROM devices WHERE id=? AND revoked=0 AND execution_mode='server')",
+                                     (json.dumps(uncertain), job['id'], device)).rowcount
+                if claimed:
+                    db.execute('INSERT INTO events(device,job,payload,created) VALUES(?,?,?,?)',
+                               (device, job['id'], json.dumps(dict(uncertain, lesson=json.loads(job['payload']))), time.time()))
+            if not claimed:
+                continue
+            try:
+                result = await submit_checkin(client, sid, job['lesson'], config)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                result = uncertain
+            with store.db() as db:
+                db.execute('UPDATE jobs SET result=? WHERE id=?', (json.dumps(result), job['id']))
+                # Replace the provisional event with a new sequence so a concurrent reader
+                # that saw uncertainty can still observe the definitive result.
+                db.execute('DELETE FROM events WHERE job=?', (job['id'],))
+                db.execute('INSERT INTO events(device,job,payload,created) VALUES(?,?,?,?)',
+                           (device, job['id'], json.dumps(dict(result, lesson=json.loads(job['payload']))), time.time()))
+
+    async def poll_device(client, device):
+        async with execution_lock:
+            with store.db() as db:
+                device = db.execute('SELECT * FROM devices WHERE id=? AND revoked=0', (device['id'],)).fetchone()
+            if not device or device['execution_mode'] == 'local':
+                return
+            try:
+                sid = cipher.decrypt(device['credential'].encode()).decode()
+                config = json.loads(cipher.decrypt(device['checkin_config'].encode()).decode()) if device['checkin_config'] else {}
+                lessons = await fetch_lessons(client, sid, device['credential_kind'])
+                for lesson in lessons:
+                    if device['execution_mode'] == 'server':
+                        delay = config.get('delay_seconds', 0)
+                        store.enqueue(device['id'], lesson, delay=delay, ttl=max(180, delay + 180))
+                    else:
+                        store.enqueue(device['id'], lesson)
+                if device['execution_mode'] == 'server':
+                    await execute_pending(client, device['id'], sid, config)
+                status = 'listening'
+            except asyncio.CancelledError:
+                raise
+            except ValueError:
+                status = 'upstream_rejected_or_invalid'
+            except Exception:
+                status = 'network_or_credential_error'
+            with store.db() as db:
+                db.execute('UPDATE devices SET status=? WHERE id=?', (status, device['id']))
 
     async def poll():
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
@@ -178,21 +331,7 @@ def create_app(db_path=None, admin_token=None, encryption_key=None, monitor=True
                 with store.db() as db:
                     devices = db.execute('SELECT * FROM devices WHERE revoked=0 AND credential IS NOT NULL').fetchall()
                 for device in devices:
-                    try:
-                        sid = cipher.decrypt(device['credential'].encode()).decode()
-                        lessons = await fetch_lessons(client, sid, device['credential_kind'])
-                        for lesson in lessons:
-                            store.enqueue(device['id'], lesson)
-                        status = 'listening'
-                    except asyncio.CancelledError:
-                        raise
-                    except ValueError:
-                        status = 'upstream_rejected_or_invalid'
-                    except Exception:
-                        # Never log upstream bodies, cookies or exception URLs.
-                        status = 'network_or_credential_error'
-                    with store.db() as db:
-                        db.execute('UPDATE devices SET status=? WHERE id=?', (status, device['id']))
+                    await poll_device(client, device)
                 await asyncio.sleep(interval)
 
     @asynccontextmanager
@@ -209,6 +348,39 @@ def create_app(db_path=None, admin_token=None, encryption_key=None, monitor=True
 
     app = FastAPI(title='Nailong RainClassroom Assistant Server', lifespan=lifespan)
     app.state.store = store
+    app.state.poll_device = poll_device
+
+    @app.put('/v1/device/mode')
+    async def set_mode(body: ExecutionMode, auth: HTTPAuthorizationCredentials = Depends(bearer)):
+        async with execution_lock:
+            with store.db() as db:
+                row = db.execute('SELECT * FROM devices WHERE token=? AND revoked=0', (digest(auth.credentials),)).fetchone()
+                if not row:
+                    raise HTTPException(401, 'invalid_device_token')
+                if body.mode == 'server' and (row['credential_kind'] != 'mobile' or not row['credential']):
+                    raise HTTPException(409, 'mobile_credentials_required')
+                active = db.execute("SELECT 1 FROM jobs WHERE device=? AND kind='checkin' AND done=0 "
+                                    'AND lease_until>?', (row['id'], time.time())).fetchone()
+                if active:
+                    raise HTTPException(409, 'client_execution_in_flight')
+                if any(not item.isascii() or not item.isdigit() or len(item) > 30 for item in body.checked_lessons):
+                    raise HTTPException(422, 'invalid_checked_lesson')
+                for lesson in body.checked_lessons:
+                    now = time.time()
+                    db.execute('INSERT INTO jobs(id,device,lesson,payload,created,available,expires,done,result) '
+                               'VALUES(?,?,?,?,?,?,?,1,?) ON CONFLICT(device,lesson) DO UPDATE '
+                               'SET done=1,result=excluded.result WHERE jobs.done=0',
+                               (secrets.token_urlsafe(18), row['id'], lesson, '{}', now, now, now,
+                                json.dumps({'success': True, 'message': 'already_checked_locally'})))
+                db.execute('UPDATE devices SET execution_mode=?,status=? WHERE id=?',
+                           (body.mode, 'paused' if body.mode == 'local' else 'configured', row['id']))
+                if body.mode == 'local':
+                    db.execute("DELETE FROM jobs WHERE device=? AND kind='checkin' AND done=0", (row['id'],))
+                checked = [job['lesson'] for job in db.execute(
+                    "SELECT lesson,result FROM jobs WHERE device=? AND kind='checkin' AND done=1 "
+                    'ORDER BY created DESC LIMIT 5000', (row['id'],))
+                    if json.loads(job['result'] or '{}').get('success')]
+            return {'mode': body.mode, 'protocol_version': 3, 'checked_lessons': checked}
 
     def require_admin(auth: HTTPAuthorizationCredentials = Depends(bearer)):
         if not hmac.compare_digest(auth.credentials, admin):
@@ -221,6 +393,30 @@ def create_app(db_path=None, admin_token=None, encryption_key=None, monitor=True
         if not device:
             raise HTTPException(401, 'invalid_device_token')
         return device['id']
+
+    @app.get('/v1/device/events')
+    def events(after: int = 0, device=Depends(require_device)):
+        if after < 0:
+            raise HTTPException(422, 'invalid_cursor')
+        with store.db() as db:
+            rows = db.execute('SELECT * FROM events WHERE device=? AND seq>? ORDER BY seq LIMIT 100',
+                              (device, after)).fetchall()
+            state = db.execute('SELECT execution_mode,status FROM devices WHERE id=?', (device,)).fetchone()
+        return {'events': [dict(seq=r['seq'], job_id=r['job'], created=r['created'],
+                                **json.loads(r['payload'])) for r in rows],
+                'cursor': rows[-1]['seq'] if rows else after,
+                'mode': state['execution_mode'], 'status': state['status']}
+
+    @app.put('/v1/device/checkin-config')
+    async def checkin_config(body: CheckinConfig, device=Depends(require_device)):
+        async with execution_lock:
+            encrypted = cipher.encrypt(body.model_dump_json().encode()).decode()
+            with store.db() as db:
+                updated = db.execute('UPDATE devices SET checkin_config=? WHERE id=? AND revoked=0',
+                                     (encrypted, device)).rowcount
+            if not updated:
+                raise HTTPException(401, 'device_revoked')
+        return {'status': 'saved'}
 
     @app.get('/health')
     def health():

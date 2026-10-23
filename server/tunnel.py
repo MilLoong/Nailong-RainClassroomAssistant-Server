@@ -18,8 +18,9 @@ def device_gateway(app):
         if scope['type'] != 'http':
             return
         path = scope.get('path', '')
-        allowed = path in ('/health', '/v1/pair', '/v1/device', '/v1/device/info', '/v1/device/credentials', '/v1/device/tasks/next')
+        allowed = path in ('/health', '/v1/pair', '/v1/device', '/v1/device/info', '/v1/device/credentials', '/v1/device/tasks/next', '/v1/device/mode', '/v1/device/events')
         allowed = allowed or (path.startswith('/v1/device/tasks/') and path.endswith('/result'))
+        allowed = allowed or path == '/v1/device/checkin-config'
         if not allowed:
             response = JSONResponse({'detail': 'not_found'}, status_code=404)
             await response(scope, receive, send)

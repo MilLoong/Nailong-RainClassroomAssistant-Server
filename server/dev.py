@@ -163,7 +163,9 @@ def create_dev_app(directory, ip, port=8000, monitor=True, public_mode=False, di
         if test:
             if test['done']:
                 result = json.loads(test['result'])
-                test_status = ('手机已回报：通知已提交 Android 系统，请查看手机通知栏'
+                test_status = ('通知已持久保存，等待客户端同步；此状态不代表手机已经展示'
+                               if result.get('message') == 'notification_stored_for_sync' else
+                               '手机已回报：通知已提交 Android 系统，请查看手机通知栏'
                                if result.get('success') else '手机已回报失败：' + result.get('message', 'unknown'))
             elif test['expires'] <= time.time():
                 test_status = '测试通知已过期，未收到完成回报，请检查手机服务、网络和通知权限'
